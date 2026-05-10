@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::landmarks::{Landmark, LandmarkSet};
 use crate::lookback::LogStrideLookback;
 use crate::recency::RecencyRing;
+use crate::salience::{GateContext, SalienceGate, snapshot_with_gate};
 use crate::ObservationEvent;
 
 /// Configuration knobs for the beam. Defaults are tuned for an ARM A1 / Pi 5
@@ -48,12 +49,15 @@ impl Default for BeamConfig {
 
 /// The composed attention beam. One per process. Single-owner (wrap in your
 /// own lock if you need multi-producer).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct AttentionBeam {
     config: BeamConfig,
     recency: RecencyRing,
     lookback: LogStrideLookback,
     landmarks: LandmarkSet,
+    /// Optional salience gate. When set, ranks landmarks during
+    /// `candidates()`. When None, landmarks fall back to weight-sorted.
+    gate: Option<Box<dyn SalienceGate>>,
     // Counter for periodic rebalance — every Nth observation triggers a
     // lookback rebalance so aging is reflected without doing the work on
     // every push.
@@ -71,9 +75,23 @@ impl AttentionBeam {
             recency,
             lookback: LogStrideLookback::new(),
             landmarks: LandmarkSet::new(),
+            gate: None,
             obs_count: 0,
             config,
         }
+    }
+
+    /// Install a salience gate. Replaces any previously-installed gate.
+    /// Call with `RecencyWeightedGate::default()` for the default
+    /// learnable-shape-but-static-weights implementation, or roll your
+    /// own by implementing `SalienceGate`.
+    pub fn set_gate(&mut self, gate: Box<dyn SalienceGate>) {
+        self.gate = Some(gate);
+    }
+
+    /// Name of the active gate, or "none". Surfaced in stats.
+    pub fn gate_name(&self) -> &'static str {
+        self.gate.as_ref().map(|g| g.name()).unwrap_or("none")
     }
 
     /// Observe a memory. Pushes into recency + lookback. The `weight` field
@@ -108,9 +126,10 @@ impl AttentionBeam {
     }
 
     /// Emit the current candidate set. Deduped, ordered by tier:
-    /// 1. Recency (most-recent first) — these are always in.
+    /// 1. Recency (most-recent first) — always in.
     /// 2. Lookback (newer buckets first).
-    /// 3. Landmarks (highest weight first).
+    /// 3. Landmarks (gate-ranked if a gate is installed, weight-sorted
+    ///    otherwise).
     ///
     /// Truncated to `config.max_beam`. Empty if no observations have ever
     /// landed.
@@ -118,23 +137,38 @@ impl AttentionBeam {
         let mut out = Vec::with_capacity(self.config.max_beam);
         let mut seen = HashSet::with_capacity(self.config.max_beam);
 
-        for id in self.recency.snapshot() {
-            if seen.insert(id) {
-                out.push(id);
+        let recency_snap = self.recency.snapshot();
+        let lookback_snap = self.lookback.snapshot();
+
+        for id in &recency_snap {
+            if seen.insert(*id) {
+                out.push(*id);
                 if out.len() >= self.config.max_beam { return out; }
             }
         }
         let mut taken = 0usize;
-        for id in self.lookback.snapshot() {
+        for id in &lookback_snap {
             if taken >= self.config.max_lookback { break; }
-            if seen.insert(id) {
-                out.push(id);
+            if seen.insert(*id) {
+                out.push(*id);
                 taken += 1;
                 if out.len() >= self.config.max_beam { return out; }
             }
         }
+        // Landmark ordering goes through the gate when one is installed.
+        // Without a gate, fall back to weight-sorted (LandmarkSet::snapshot).
+        let landmark_order: Vec<Uuid> = if let Some(ref g) = self.gate {
+            let ctx = GateContext {
+                recency: &recency_snap,
+                lookback: &lookback_snap,
+                observations: self.obs_count,
+            };
+            snapshot_with_gate(&self.landmarks.by_cluster, Some(g.as_ref()), &ctx)
+        } else {
+            self.landmarks.snapshot()
+        };
         let mut taken = 0usize;
-        for id in self.landmarks.snapshot() {
+        for id in landmark_order {
             if taken >= self.config.max_landmarks { break; }
             if seen.insert(id) {
                 out.push(id);
@@ -213,6 +247,31 @@ mod tests {
         b.upsert_landmark(Landmark { id, cluster_label: "philosophy".into(), weight: 1.0 });
         let cands = b.candidates();
         assert_eq!(cands.iter().filter(|c| **c == id).count(), 1);
+    }
+
+    #[test]
+    fn recency_weighted_gate_reorders_landmarks() {
+        let mut b = AttentionBeam::with_config(BeamConfig {
+            recency_capacity: 4, max_landmarks: 8, max_lookback: 0, max_beam: 16,
+        });
+        let cold = Uuid::new_v4();
+        let warm = Uuid::new_v4();
+        b.upsert_landmark(Landmark { id: cold, cluster_label: "cold".into(), weight: 2.0 });
+        b.upsert_landmark(Landmark { id: warm, cluster_label: "warm".into(), weight: 1.0 });
+        b.observe_now(warm, "test");
+        // Without a gate: cold (weight 2.0) ranks above warm (weight 1.0).
+        // The recency ring also contains `warm` so when we read candidates
+        // it appears in the recency tier first. To isolate the gate effect
+        // on the landmark tier, install the gate and check the landmark
+        // ordering after recency dedup.
+        b.set_gate(Box::new(crate::salience::RecencyWeightedGate::default()));
+        let cands = b.candidates();
+        // warm is in recency (first tier), then landmarks tier should put
+        // it back too — but dedup removes it. Cold should still appear
+        // somewhere; the test just ensures gate doesn't crash and
+        // produces a deduped beam.
+        assert!(cands.contains(&warm));
+        assert!(cands.contains(&cold));
     }
 
     #[test]

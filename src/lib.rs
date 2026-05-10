@@ -48,11 +48,13 @@ pub mod recency;
 pub mod lookback;
 pub mod landmarks;
 pub mod beam;
+pub mod salience;
 
 pub use beam::{AttentionBeam, BeamConfig};
 pub use recency::RecencyRing;
 pub use lookback::LogStrideLookback;
 pub use landmarks::LandmarkSet;
+pub use salience::{SalienceGate, StaticGate, RecencyWeightedGate, GateContext};
 
 /// An attention event from a sensor (eye, ear, recall, dream, etc.). Drives
 /// gravity in the beam — repeated events on the same memory pull harder.

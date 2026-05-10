@@ -35,7 +35,7 @@ pub struct Landmark {
 #[derive(Debug, Default, Clone)]
 pub struct LandmarkSet {
     /// cluster_label -> Landmark
-    by_cluster: HashMap<String, Landmark>,
+    pub(crate) by_cluster: HashMap<String, Landmark>,
 }
 
 impl LandmarkSet {
