@@ -106,7 +106,7 @@ impl AttentionBeam {
         // Every 32 observations, rebalance the lookback so age buckets
         // stay accurate. Cheap (O(total entries)) and bounded since the
         // lookback caps total entries at ~64.
-        if self.obs_count % 32 == 0 {
+        if self.obs_count.is_multiple_of(32) {
             self.lookback.rebalance(Utc::now());
         }
     }

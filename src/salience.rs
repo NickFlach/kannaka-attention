@@ -96,10 +96,10 @@ impl Default for RecencyWeightedGate {
 impl SalienceGate for RecencyWeightedGate {
     fn score(&self, landmark: &Landmark, ctx: &GateContext<'_>) -> f32 {
         // Recency check — small N (typically 128), linear scan is fine.
-        if ctx.recency.iter().any(|x| *x == landmark.id) {
+        if ctx.recency.contains(&landmark.id) {
             return landmark.weight * self.recency_boost;
         }
-        if ctx.lookback.iter().any(|x| *x == landmark.id) {
+        if ctx.lookback.contains(&landmark.id) {
             return landmark.weight * self.lookback_boost;
         }
         landmark.weight
