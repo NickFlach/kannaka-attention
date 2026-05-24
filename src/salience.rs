@@ -47,7 +47,9 @@ pub trait SalienceGate: std::fmt::Debug + Send + Sync {
     fn score(&self, landmark: &Landmark, ctx: &GateContext<'_>) -> f32;
 
     /// Optional name for telemetry / observatory display.
-    fn name(&self) -> &'static str { "unnamed" }
+    fn name(&self) -> &'static str {
+        "unnamed"
+    }
 }
 
 /// The no-op gate. Returns `landmark.weight` unchanged. This is the
@@ -59,7 +61,9 @@ impl SalienceGate for StaticGate {
     fn score(&self, landmark: &Landmark, _ctx: &GateContext<'_>) -> f32 {
         landmark.weight
     }
-    fn name(&self) -> &'static str { "static" }
+    fn name(&self) -> &'static str {
+        "static"
+    }
 }
 
 /// Recency-weighted gate. A landmark whose exemplar id is currently in
@@ -82,7 +86,10 @@ pub struct RecencyWeightedGate {
 
 impl Default for RecencyWeightedGate {
     fn default() -> Self {
-        Self { recency_boost: 2.0, lookback_boost: 1.3 }
+        Self {
+            recency_boost: 2.0,
+            lookback_boost: 1.3,
+        }
     }
 }
 
@@ -97,7 +104,9 @@ impl SalienceGate for RecencyWeightedGate {
         }
         landmark.weight
     }
-    fn name(&self) -> &'static str { "recency-weighted" }
+    fn name(&self) -> &'static str {
+        "recency-weighted"
+    }
 }
 
 /// Score every landmark in `set` using `gate` against `ctx`, returning
@@ -108,7 +117,8 @@ pub fn rank_landmarks(
     gate: &dyn SalienceGate,
     ctx: &GateContext<'_>,
 ) -> Vec<(Uuid, f32)> {
-    let mut scored: Vec<(Uuid, f32)> = set.iter()
+    let mut scored: Vec<(Uuid, f32)> = set
+        .iter()
         .map(|(id, l)| (*id, gate.score(l, ctx)))
         .collect();
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -122,10 +132,17 @@ pub(crate) fn snapshot_with_gate(
     gate: Option<&dyn SalienceGate>,
     ctx: &GateContext<'_>,
 ) -> Vec<Uuid> {
-    if by_cluster.is_empty() { return Vec::new(); }
-    let mut entries: Vec<(Uuid, f32, &Landmark)> = by_cluster.values()
+    if by_cluster.is_empty() {
+        return Vec::new();
+    }
+    let mut entries: Vec<(Uuid, f32, &Landmark)> = by_cluster
+        .values()
         .map(|l| {
-            let s = if let Some(g) = gate { g.score(l, ctx) } else { l.weight };
+            let s = if let Some(g) = gate {
+                g.score(l, ctx)
+            } else {
+                l.weight
+            };
             (l.id, s, l)
         })
         .collect();
@@ -138,14 +155,22 @@ mod tests {
     use super::*;
 
     fn landmark(id: Uuid, w: f32) -> Landmark {
-        Landmark { id, cluster_label: format!("c-{}", &id.to_string()[..4]), weight: w }
+        Landmark {
+            id,
+            cluster_label: format!("c-{}", &id.to_string()[..4]),
+            weight: w,
+        }
     }
 
     #[test]
     fn static_gate_returns_weight_unchanged() {
         let id = Uuid::new_v4();
         let l = landmark(id, 0.7);
-        let ctx = GateContext { recency: &[], lookback: &[], observations: 0 };
+        let ctx = GateContext {
+            recency: &[],
+            lookback: &[],
+            observations: 0,
+        };
         assert_eq!(StaticGate.score(&l, &ctx), 0.7);
     }
 
@@ -153,7 +178,11 @@ mod tests {
     fn recency_gate_boosts_when_id_in_recency_ring() {
         let id = Uuid::new_v4();
         let l = landmark(id, 1.0);
-        let ctx = GateContext { recency: &[id], lookback: &[], observations: 1 };
+        let ctx = GateContext {
+            recency: &[id],
+            lookback: &[],
+            observations: 1,
+        };
         let g = RecencyWeightedGate::default();
         let s = g.score(&l, &ctx);
         assert!((s - 2.0).abs() < 1e-6, "expected ~2.0 boost, got {}", s);
@@ -163,7 +192,11 @@ mod tests {
     fn recency_gate_lookback_only_lighter_boost() {
         let id = Uuid::new_v4();
         let l = landmark(id, 1.0);
-        let ctx = GateContext { recency: &[], lookback: &[id], observations: 5 };
+        let ctx = GateContext {
+            recency: &[],
+            lookback: &[id],
+            observations: 5,
+        };
         let g = RecencyWeightedGate::default();
         let s = g.score(&l, &ctx);
         assert!((s - 1.3).abs() < 1e-6, "expected ~1.3 boost, got {}", s);
@@ -174,7 +207,11 @@ mod tests {
         let id = Uuid::new_v4();
         let other = Uuid::new_v4();
         let l = landmark(id, 0.5);
-        let ctx = GateContext { recency: &[other], lookback: &[], observations: 0 };
+        let ctx = GateContext {
+            recency: &[other],
+            lookback: &[],
+            observations: 0,
+        };
         let g = RecencyWeightedGate::default();
         assert_eq!(g.score(&l, &ctx), 0.5);
     }

@@ -21,13 +21,13 @@ use uuid::Uuid;
 /// An entry whose age is `< boundary[k]` belongs in bucket `k`. The implicit
 /// final bucket holds everything older than the last boundary.
 pub const DEFAULT_BOUNDARIES_SECONDS: &[i64] = &[
-    60,            // < 1 min
-    5 * 60,        // < 5 min
-    30 * 60,       // < 30 min
-    3 * 3600,      // < 3 h
-    24 * 3600,     // < 1 d
-    7 * 24 * 3600, // < 7 d
-    30 * 24 * 3600,// < 30 d
+    60,             // < 1 min
+    5 * 60,         // < 5 min
+    30 * 60,        // < 30 min
+    3 * 3600,       // < 3 h
+    24 * 3600,      // < 1 d
+    7 * 24 * 3600,  // < 7 d
+    30 * 24 * 3600, // < 30 d
 ];
 
 /// Per-memory state inside the lookback.
@@ -61,8 +61,11 @@ impl LogStrideLookback {
     /// Custom boundaries + per-bucket cap. The boundaries must be ascending;
     /// duplicates are tolerated but waste a bucket.
     pub fn with_config(boundaries_seconds: &[i64], bucket_cap: usize) -> Self {
-        let boundaries: Vec<Duration> =
-            boundaries_seconds.iter().copied().map(Duration::seconds).collect();
+        let boundaries: Vec<Duration> = boundaries_seconds
+            .iter()
+            .copied()
+            .map(Duration::seconds)
+            .collect();
         let n_buckets = boundaries.len() + 1;
         Self {
             boundaries,
@@ -86,7 +89,12 @@ impl LogStrideLookback {
             return;
         }
         // First observation. New entries start in bucket 0 (newest).
-        let entry = Entry { id, first_seen: now, last_seen: now, observation_count: 1 };
+        let entry = Entry {
+            id,
+            first_seen: now,
+            last_seen: now,
+            observation_count: 1,
+        };
         let bucket = 0;
         let buf = &mut self.buckets[bucket];
         if buf.len() >= self.bucket_cap {
@@ -95,7 +103,9 @@ impl LogStrideLookback {
             // count=1, so by default they lose to anyone with count>=2 —
             // which is the right call: high-observation-count memories
             // should stick.
-            let (min_pos, min_count) = buf.iter().enumerate()
+            let (min_pos, min_count) = buf
+                .iter()
+                .enumerate()
                 .map(|(p, e)| (p, e.observation_count))
                 .min_by_key(|&(_, c)| c)
                 .unwrap();
@@ -134,7 +144,9 @@ impl LogStrideLookback {
                 let buf = &mut new_buckets[target];
                 if buf.len() >= cap {
                     // Lowest-weight eviction within the destination bucket.
-                    if let Some((min_pos, _)) = buf.iter().enumerate()
+                    if let Some((min_pos, _)) = buf
+                        .iter()
+                        .enumerate()
                         .min_by_key(|(_, e)| e.observation_count)
                     {
                         if buf[min_pos].observation_count < entry.observation_count {
@@ -155,7 +167,9 @@ impl LogStrideLookback {
 
     fn bucket_for_age(boundaries: &[Duration], age: Duration) -> usize {
         for (i, b) in boundaries.iter().enumerate() {
-            if age < *b { return i; }
+            if age < *b {
+                return i;
+            }
         }
         boundaries.len() // overflow bucket
     }
@@ -172,15 +186,20 @@ impl LogStrideLookback {
     }
 
     /// Total entries across all buckets.
-    pub fn len(&self) -> usize { self.locator.len() }
+    pub fn len(&self) -> usize {
+        self.locator.len()
+    }
 
     /// True if empty.
-    pub fn is_empty(&self) -> bool { self.locator.is_empty() }
-
+    pub fn is_empty(&self) -> bool {
+        self.locator.is_empty()
+    }
 }
 
 impl Default for LogStrideLookback {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -218,8 +237,11 @@ mod tests {
         let mid = Uuid::new_v4();
         let low = Uuid::new_v4();
         let t = Utc::now();
-        l.observe(high, t); l.observe(high, t); l.observe(high, t);
-        l.observe(mid, t);  l.observe(mid, t);
+        l.observe(high, t);
+        l.observe(high, t);
+        l.observe(high, t);
+        l.observe(mid, t);
+        l.observe(mid, t);
         // bucket 0 full at cap=2. Inserting `low` should evict the lowest:
         // `low` itself is the lowest (count=1), so it's dropped on insert
         // and `high`+`mid` survive.

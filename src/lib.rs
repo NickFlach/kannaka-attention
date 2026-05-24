@@ -44,17 +44,17 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-pub mod recency;
-pub mod lookback;
-pub mod landmarks;
 pub mod beam;
+pub mod landmarks;
+pub mod lookback;
+pub mod recency;
 pub mod salience;
 
 pub use beam::{AttentionBeam, BeamConfig};
-pub use recency::RecencyRing;
-pub use lookback::LogStrideLookback;
 pub use landmarks::LandmarkSet;
-pub use salience::{SalienceGate, StaticGate, RecencyWeightedGate, GateContext};
+pub use lookback::LogStrideLookback;
+pub use recency::RecencyRing;
+pub use salience::{GateContext, RecencyWeightedGate, SalienceGate, StaticGate};
 
 /// An attention event from a sensor (eye, ear, recall, dream, etc.). Drives
 /// gravity in the beam — repeated events on the same memory pull harder.
@@ -79,6 +79,11 @@ impl ObservationEvent {
     /// Build an event from the common case: a memory id + a source label.
     /// Uses `now()` for the timestamp and weight = 1.0.
     pub fn now(memory_id: Uuid, source: impl Into<String>) -> Self {
-        Self { memory_id, source: source.into(), weight: 1.0, ts: Utc::now() }
+        Self {
+            memory_id,
+            source: source.into(),
+            weight: 1.0,
+            ts: Utc::now(),
+        }
     }
 }

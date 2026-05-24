@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::landmarks::{Landmark, LandmarkSet};
 use crate::lookback::LogStrideLookback;
 use crate::recency::RecencyRing;
-use crate::salience::{GateContext, SalienceGate, snapshot_with_gate};
+use crate::salience::{snapshot_with_gate, GateContext, SalienceGate};
 use crate::ObservationEvent;
 
 /// Configuration knobs for the beam. Defaults are tuned for an ARM A1 / Pi 5
@@ -66,7 +66,9 @@ pub struct AttentionBeam {
 
 impl AttentionBeam {
     /// Build with default config.
-    pub fn new() -> Self { Self::with_config(BeamConfig::default()) }
+    pub fn new() -> Self {
+        Self::with_config(BeamConfig::default())
+    }
 
     /// Build with explicit config.
     pub fn with_config(config: BeamConfig) -> Self {
@@ -118,7 +120,9 @@ impl AttentionBeam {
     /// Register/refresh a landmark. Typically fed from a NATS subscriber on
     /// `KANNAKA.exemplar.>` so the beam always knows the current exemplar
     /// per cluster.
-    pub fn upsert_landmark(&mut self, l: Landmark) { self.landmarks.upsert(l); }
+    pub fn upsert_landmark(&mut self, l: Landmark) {
+        self.landmarks.upsert(l);
+    }
 
     /// Remove a landmark by cluster label.
     pub fn drop_landmark(&mut self, cluster_label: &str) {
@@ -143,16 +147,22 @@ impl AttentionBeam {
         for id in &recency_snap {
             if seen.insert(*id) {
                 out.push(*id);
-                if out.len() >= self.config.max_beam { return out; }
+                if out.len() >= self.config.max_beam {
+                    return out;
+                }
             }
         }
         let mut taken = 0usize;
         for id in &lookback_snap {
-            if taken >= self.config.max_lookback { break; }
+            if taken >= self.config.max_lookback {
+                break;
+            }
             if seen.insert(*id) {
                 out.push(*id);
                 taken += 1;
-                if out.len() >= self.config.max_beam { return out; }
+                if out.len() >= self.config.max_beam {
+                    return out;
+                }
             }
         }
         // Landmark ordering goes through the gate when one is installed.
@@ -169,11 +179,15 @@ impl AttentionBeam {
         };
         let mut taken = 0usize;
         for id in landmark_order {
-            if taken >= self.config.max_landmarks { break; }
+            if taken >= self.config.max_landmarks {
+                break;
+            }
             if seen.insert(id) {
                 out.push(id);
                 taken += 1;
-                if out.len() >= self.config.max_beam { return out; }
+                if out.len() >= self.config.max_beam {
+                    return out;
+                }
             }
         }
         out
@@ -192,7 +206,9 @@ impl AttentionBeam {
 }
 
 impl Default for AttentionBeam {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Snapshot of beam internals for telemetry. Cheap to compute.
@@ -234,7 +250,11 @@ mod tests {
     fn landmark_only_no_observations_still_emits() {
         let mut b = AttentionBeam::new();
         let id = Uuid::new_v4();
-        b.upsert_landmark(Landmark { id, cluster_label: "philosophy".into(), weight: 1.0 });
+        b.upsert_landmark(Landmark {
+            id,
+            cluster_label: "philosophy".into(),
+            weight: 1.0,
+        });
         let cands = b.candidates();
         assert_eq!(cands, vec![id]);
     }
@@ -244,7 +264,11 @@ mod tests {
         let mut b = AttentionBeam::new();
         let id = Uuid::new_v4();
         b.observe_now(id, "eye:left");
-        b.upsert_landmark(Landmark { id, cluster_label: "philosophy".into(), weight: 1.0 });
+        b.upsert_landmark(Landmark {
+            id,
+            cluster_label: "philosophy".into(),
+            weight: 1.0,
+        });
         let cands = b.candidates();
         assert_eq!(cands.iter().filter(|c| **c == id).count(), 1);
     }
@@ -252,12 +276,23 @@ mod tests {
     #[test]
     fn recency_weighted_gate_reorders_landmarks() {
         let mut b = AttentionBeam::with_config(BeamConfig {
-            recency_capacity: 4, max_landmarks: 8, max_lookback: 0, max_beam: 16,
+            recency_capacity: 4,
+            max_landmarks: 8,
+            max_lookback: 0,
+            max_beam: 16,
         });
         let cold = Uuid::new_v4();
         let warm = Uuid::new_v4();
-        b.upsert_landmark(Landmark { id: cold, cluster_label: "cold".into(), weight: 2.0 });
-        b.upsert_landmark(Landmark { id: warm, cluster_label: "warm".into(), weight: 1.0 });
+        b.upsert_landmark(Landmark {
+            id: cold,
+            cluster_label: "cold".into(),
+            weight: 2.0,
+        });
+        b.upsert_landmark(Landmark {
+            id: warm,
+            cluster_label: "warm".into(),
+            weight: 1.0,
+        });
         b.observe_now(warm, "test");
         // Without a gate: cold (weight 2.0) ranks above warm (weight 1.0).
         // The recency ring also contains `warm` so when we read candidates

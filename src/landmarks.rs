@@ -40,7 +40,9 @@ pub struct LandmarkSet {
 
 impl LandmarkSet {
     /// Empty set.
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Upsert a landmark. If the cluster_label is already known, replace it
     /// — the medium's exemplar can drift over time as the cluster evolves.
@@ -57,15 +59,23 @@ impl LandmarkSet {
     /// how many to actually use.
     pub fn snapshot(&self) -> Vec<Uuid> {
         let mut entries: Vec<&Landmark> = self.by_cluster.values().collect();
-        entries.sort_by(|a, b| b.weight.partial_cmp(&a.weight).unwrap_or(std::cmp::Ordering::Equal));
+        entries.sort_by(|a, b| {
+            b.weight
+                .partial_cmp(&a.weight)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         entries.into_iter().map(|l| l.id).collect()
     }
 
     /// Number of clusters tracked.
-    pub fn len(&self) -> usize { self.by_cluster.len() }
+    pub fn len(&self) -> usize {
+        self.by_cluster.len()
+    }
 
     /// True if no landmarks have been registered yet.
-    pub fn is_empty(&self) -> bool { self.by_cluster.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.by_cluster.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -77,8 +87,16 @@ mod tests {
         let mut s = LandmarkSet::new();
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
-        s.upsert(Landmark { id: a, cluster_label: "philosophy".into(), weight: 1.0 });
-        s.upsert(Landmark { id: b, cluster_label: "philosophy".into(), weight: 1.0 });
+        s.upsert(Landmark {
+            id: a,
+            cluster_label: "philosophy".into(),
+            weight: 1.0,
+        });
+        s.upsert(Landmark {
+            id: b,
+            cluster_label: "philosophy".into(),
+            weight: 1.0,
+        });
         assert_eq!(s.len(), 1);
         assert_eq!(s.snapshot(), vec![b]);
     }
@@ -88,8 +106,16 @@ mod tests {
         let mut s = LandmarkSet::new();
         let high = Uuid::new_v4();
         let low = Uuid::new_v4();
-        s.upsert(Landmark { id: low,  cluster_label: "a".into(), weight: 0.3 });
-        s.upsert(Landmark { id: high, cluster_label: "b".into(), weight: 0.9 });
+        s.upsert(Landmark {
+            id: low,
+            cluster_label: "a".into(),
+            weight: 0.3,
+        });
+        s.upsert(Landmark {
+            id: high,
+            cluster_label: "b".into(),
+            weight: 0.9,
+        });
         assert_eq!(s.snapshot(), vec![high, low]);
     }
 }

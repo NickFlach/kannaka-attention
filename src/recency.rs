@@ -24,7 +24,10 @@ impl RecencyRing {
     /// large enough to span a small conversation, small enough to be cheap
     /// even on a Pi Zero.
     pub fn new(capacity: usize) -> Self {
-        Self { capacity: capacity.max(1), buf: VecDeque::with_capacity(capacity) }
+        Self {
+            capacity: capacity.max(1),
+            buf: VecDeque::with_capacity(capacity),
+        }
     }
 
     /// Push an observation. If `id` is already in the ring it's moved to the
@@ -48,13 +51,19 @@ impl RecencyRing {
     }
 
     /// Current population.
-    pub fn len(&self) -> usize { self.buf.len() }
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
 
     /// True if the ring is empty.
-    pub fn is_empty(&self) -> bool { self.buf.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
 
     /// Configured capacity (max population).
-    pub fn capacity(&self) -> usize { self.capacity }
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
 }
 
 #[cfg(test)]
@@ -67,7 +76,9 @@ mod tests {
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         let c = Uuid::new_v4();
-        r.push(a); r.push(b); r.push(c);
+        r.push(a);
+        r.push(b);
+        r.push(c);
         assert_eq!(r.snapshot(), vec![c, b, a]);
     }
 
@@ -76,7 +87,9 @@ mod tests {
         let mut r = RecencyRing::new(3);
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
-        r.push(a); r.push(b); r.push(a);
+        r.push(a);
+        r.push(b);
+        r.push(a);
         assert_eq!(r.len(), 2);
         assert_eq!(r.snapshot(), vec![a, b]);
     }
@@ -87,7 +100,9 @@ mod tests {
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         let c = Uuid::new_v4();
-        r.push(a); r.push(b); r.push(c);
+        r.push(a);
+        r.push(b);
+        r.push(c);
         assert_eq!(r.snapshot(), vec![c, b]);
     }
 }
