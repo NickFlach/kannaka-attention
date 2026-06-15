@@ -156,9 +156,16 @@ impl LogStrideLookback {
                         }
                     }
                 }
-                let pos = buf.len();
-                new_locator.insert(entry.id, (target, pos));
                 buf.push(entry);
+            }
+        }
+        // Rebuild the locator in a single final pass AFTER all entries are
+        // placed. Doing it per-push above leaves stale (bucket, position)
+        // pairs whenever a later eviction (`buf.remove(min_pos)`) shifts the
+        // surviving entries down by one index. (#11)
+        for (b, bucket) in new_buckets.iter().enumerate() {
+            for (p, e) in bucket.iter().enumerate() {
+                new_locator.insert(e.id, (b, p));
             }
         }
         self.buckets = new_buckets;
