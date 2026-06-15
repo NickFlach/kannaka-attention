@@ -46,7 +46,13 @@ impl LandmarkSet {
 
     /// Upsert a landmark. If the cluster_label is already known, replace it
     /// — the medium's exemplar can drift over time as the cluster evolves.
-    pub fn upsert(&mut self, l: Landmark) {
+    pub fn upsert(&mut self, mut l: Landmark) {
+        // Sanitize untrusted weights (NATS exemplars can carry NaN/Inf).
+        // A non-finite weight breaks strict-weak-ordering in the sort and
+        // scrambles landmark order. Default such weights to 1.0. (#12)
+        if !l.weight.is_finite() {
+            l.weight = 1.0;
+        }
         self.by_cluster.insert(l.cluster_label.clone(), l);
     }
 
@@ -59,11 +65,9 @@ impl LandmarkSet {
     /// how many to actually use.
     pub fn snapshot(&self) -> Vec<Uuid> {
         let mut entries: Vec<&Landmark> = self.by_cluster.values().collect();
-        entries.sort_by(|a, b| {
-            b.weight
-                .partial_cmp(&a.weight)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        // total_cmp gives a total order over all f32 (incl. any non-finite
+        // that slipped past sanitization), keeping the sort well-formed. (#12)
+        entries.sort_by(|a, b| b.weight.total_cmp(&a.weight));
         entries.into_iter().map(|l| l.id).collect()
     }
 
