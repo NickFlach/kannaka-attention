@@ -36,7 +36,11 @@ The beam is **what the agent is paying attention to right now**. Composed from f
 | **Recency** | last K observations | sharp short-term focus |
 | **Lookback** | log-stride buckets (1m, 5m, 30m, 3h, 1d, 7d, 30d) | catch the medium-term recurring stuff |
 | **Landmarks** | exemplar wavefronts | always-considered anchors (ranked by gate) |
-| **Salience gate** | optional `SalienceGate` impl | reshape weights with external signal |
+| **Salience gate** | optional `SalienceGate` impl | rank the **landmark tier** with an external signal |
+
+The gate ranks landmarks only. Recency is emitted first, in recency order,
+and a gate cannot reorder it — tier 1 exists to guarantee a just-observed
+memory makes the beam, which a salience score could otherwise override.
 
 ---
 

@@ -39,6 +39,37 @@ pub struct BeamConfig {
     /// truncated to this. 256 is a sweet spot: large enough to capture
     /// associative recall, small enough that scoring is trivially fast.
     pub max_beam: usize,
+    /// Restrict the landmark tier to exemplars currently present in recency
+    /// or lookback. Default `false`.
+    ///
+    /// Off (the default), landmarks are always-considered anchors: every
+    /// registered exemplar is eligible whether or not it has ever been
+    /// observed, which is what lets a freshly started process emit a useful
+    /// beam before any observation has landed.
+    ///
+    /// On, the beam reflects *attended* state rather than catalog state —
+    /// nothing appears that was not actually seen. Consumers that treat the
+    /// beam as "what is the agent looking at right now" want this; be aware
+    /// it makes the beam empty until observations accumulate. (#5)
+    pub observed_only: bool,
+    /// Key observation identity on `(source, memory_id)` rather than
+    /// `memory_id` alone. Default `false`.
+    ///
+    /// Off (the default), two sensors observing the same memory collapse
+    /// onto one entry in recency and lookback.
+    ///
+    /// On, they hold independent slots, so a chiral mirror pair
+    /// (`eye:left` / `eye:right`) each pull on the beam in their own right.
+    /// `kannaka-eye` publishes `source` and `hemisphere` precisely so a
+    /// subscriber can choose — its own docs note that subscribers "can fold
+    /// both into the same beam, or treat them as separate attention
+    /// sources".
+    ///
+    /// Costs population: the lookback's ~64-entry ceiling is per key, so
+    /// enabling this multiplies worst-case retained entries by the number
+    /// of active sources. That ceiling underwrites the crate's edge-device
+    /// envelope, which is why this is opt-in. (#3)
+    pub per_source: bool,
 }
 
 impl Default for BeamConfig {
@@ -48,6 +79,8 @@ impl Default for BeamConfig {
             max_landmarks: 16,
             max_lookback: 32,
             max_beam: 256,
+            observed_only: false,
+            per_source: false,
         }
     }
 }
@@ -113,10 +146,25 @@ impl AttentionBeam {
     /// Bucket placement uses `ev.ts`, the event's own timestamp, not wall
     /// clock — so replayed and backdated events land where they belong and
     /// callers can write exact-time fixtures. (#25)
+    /// Recency ordering also uses `ev.ts`, so a replayed batch produces the
+    /// same beam as a live one. Arrival-order insertion meant a backdated
+    /// event took the front of the ring regardless of when it happened,
+    /// which left tier 1 disagreeing with the (already event-timed)
+    /// lookback under replay. (#4)
+    ///
+    /// When `config.per_source` is set, both structures key on
+    /// `(ev.source, ev.memory_id)`, so a mirror pair pulls independently
+    /// rather than collapsing onto one entry. (#3)
     pub fn observe(&mut self, ev: &ObservationEvent) {
-        self.recency.push(ev.memory_id);
-        self.lookback
-            .observe_weighted(ev.memory_id, ev.ts, ev.weight);
+        if self.config.per_source {
+            self.recency.push_keyed(ev.memory_id, &ev.source, ev.ts);
+            self.lookback
+                .observe_keyed(ev.memory_id, &ev.source, ev.ts, ev.weight);
+        } else {
+            self.recency.push_at(ev.memory_id, ev.ts);
+            self.lookback
+                .observe_weighted(ev.memory_id, ev.ts, ev.weight);
+        }
         self.obs_count = self.obs_count.wrapping_add(1);
     }
 
@@ -194,6 +242,17 @@ impl AttentionBeam {
             snapshot_with_gate(&self.landmarks.by_cluster, Some(g.as_ref()), &ctx)
         } else {
             self.landmarks.snapshot()
+        };
+        // `observed_only` narrows the landmark tier to exemplars actually
+        // present in an active window, so the beam reports attended state
+        // rather than catalog state. Off by default — see BeamConfig. (#5)
+        let landmark_order: Vec<Uuid> = if self.config.observed_only {
+            landmark_order
+                .into_iter()
+                .filter(|id| self.recency.contains(id) || self.lookback.contains(id))
+                .collect()
+        } else {
+            landmark_order
         };
         // Same positions-inspected accounting as the lookback tier (#21):
         // a landmark that already arrived via recency still spends its
@@ -297,6 +356,7 @@ mod tests {
             max_landmarks: 8,
             max_lookback: 0,
             max_beam: 16,
+            ..Default::default()
         });
         let cold = Uuid::new_v4();
         let warm = Uuid::new_v4();
@@ -335,6 +395,7 @@ mod tests {
             max_landmarks: 8,
             max_lookback: 8,
             max_beam: 0,
+            ..Default::default()
         });
         let id = Uuid::new_v4();
         b.observe_now(id, "test");
@@ -355,6 +416,7 @@ mod tests {
                 max_landmarks: 32,
                 max_lookback: 32,
                 max_beam,
+                ..Default::default()
             });
             for i in 0..20 {
                 b.observe_now(Uuid::new_v4(), "test");
@@ -383,6 +445,7 @@ mod tests {
             max_landmarks: 0,
             max_lookback: 1,
             max_beam: 16,
+            ..Default::default()
         });
         let a = Uuid::new_v4();
         let mid = Uuid::new_v4();
@@ -410,6 +473,7 @@ mod tests {
                 max_landmarks: 8,
                 max_lookback: 0,
                 max_beam: 16,
+                ..Default::default()
             });
             // Same weight for all — nothing but the tiebreak to separate them.
             for (n, label) in ["delta", "alpha", "charlie", "bravo"].iter().enumerate() {
@@ -437,6 +501,7 @@ mod tests {
             max_landmarks: 0,
             max_lookback: 8,
             max_beam: 16,
+            ..Default::default()
         });
         let ambient = Uuid::new_v4();
         let deliberate = Uuid::new_v4();
@@ -471,6 +536,7 @@ mod tests {
             max_landmarks: 0,
             max_lookback: 8,
             max_beam: 16,
+            ..Default::default()
         });
         let now = chrono::Utc::now();
         let ancient = Uuid::new_v4();
@@ -490,6 +556,151 @@ mod tests {
         // The 20-day-old event must sort into a far older bucket, so the
         // fresh id leads even though it was observed second.
         assert_eq!(b.candidates(), vec![fresh, ancient]);
+    }
+
+    #[test]
+    fn observed_only_filters_unobserved_landmarks() {
+        // #5 — opt-in attended-only beam.
+        let cfg = |observed_only| BeamConfig {
+            recency_capacity: 8,
+            max_landmarks: 8,
+            max_lookback: 8,
+            max_beam: 16,
+            observed_only,
+            per_source: false,
+        };
+        let seen = Uuid::from_u128(1);
+        let never = Uuid::from_u128(2);
+
+        let build = |observed_only| {
+            let mut b = AttentionBeam::with_config(cfg(observed_only));
+            b.upsert_landmark(Landmark {
+                id: seen,
+                cluster_label: "seen".into(),
+                weight: 1.0,
+            });
+            b.upsert_landmark(Landmark {
+                id: never,
+                cluster_label: "never".into(),
+                weight: 9.0,
+            });
+            b.observe_now(seen, "eye:left");
+            b.candidates()
+        };
+
+        // Default: the never-observed high-weight landmark is still an anchor.
+        let permissive = build(false);
+        assert!(permissive.contains(&never));
+        assert!(permissive.contains(&seen));
+
+        // observed_only: catalog state is excluded, attended state remains.
+        let strict = build(true);
+        assert!(
+            !strict.contains(&never),
+            "unobserved landmark must be filtered: {strict:?}"
+        );
+        assert!(
+            strict.contains(&seen),
+            "observed landmark must survive: {strict:?}"
+        );
+    }
+
+    #[test]
+    fn observed_only_beam_is_empty_before_any_observation() {
+        // The documented cost of the flag, pinned so it can't surprise
+        // anyone who enables it. (#5)
+        let mut b = AttentionBeam::with_config(BeamConfig {
+            observed_only: true,
+            ..Default::default()
+        });
+        b.upsert_landmark(Landmark {
+            id: Uuid::from_u128(7),
+            cluster_label: "cold".into(),
+            weight: 5.0,
+        });
+        assert!(b.candidates().is_empty());
+    }
+
+    #[test]
+    fn per_source_lets_a_mirror_pair_pull_independently() {
+        // #3 — left/right eye observing the same memory.
+        let cfg = |per_source| BeamConfig {
+            recency_capacity: 8,
+            max_landmarks: 0,
+            max_lookback: 8,
+            max_beam: 16,
+            observed_only: false,
+            per_source,
+        };
+        let id = Uuid::from_u128(42);
+        let t = chrono::Utc::now();
+        let build = |per_source| {
+            let mut b = AttentionBeam::with_config(cfg(per_source));
+            for (n, source) in ["eye:left", "eye:right"].iter().enumerate() {
+                b.observe(&ObservationEvent {
+                    memory_id: id,
+                    source: (*source).into(),
+                    weight: 1.0,
+                    ts: t + chrono::Duration::seconds(n as i64),
+                });
+            }
+            b.stats()
+        };
+
+        // Collapsed (default): one entry in each structure.
+        let collapsed = build(false);
+        assert_eq!(collapsed.recency_len, 1);
+        assert_eq!(collapsed.lookback_len, 1);
+
+        // Per-source: each hemisphere holds its own.
+        let split = build(true);
+        assert_eq!(split.recency_len, 2, "left and right are distinct entries");
+        assert_eq!(split.lookback_len, 2);
+
+        // Either way the emitted beam is deduped by memory id.
+        let mut b = AttentionBeam::with_config(cfg(true));
+        for source in ["eye:left", "eye:right"] {
+            b.observe(&ObservationEvent {
+                memory_id: id,
+                source: source.into(),
+                weight: 1.0,
+                ts: t,
+            });
+        }
+        assert_eq!(b.candidates(), vec![id], "candidates are still deduped");
+    }
+
+    #[test]
+    fn recency_tier_honors_event_time() {
+        // #4 — a replayed backdated event must not take the front of the
+        // beam just because it arrived last.
+        let mut b = AttentionBeam::with_config(BeamConfig {
+            recency_capacity: 8,
+            max_landmarks: 0,
+            max_lookback: 0,
+            max_beam: 16,
+            ..Default::default()
+        });
+        let now = chrono::Utc::now();
+        let fresh = Uuid::from_u128(1);
+        let ancient = Uuid::from_u128(2);
+        b.observe(&ObservationEvent {
+            memory_id: fresh,
+            source: "live".into(),
+            weight: 1.0,
+            ts: now,
+        });
+        b.observe(&ObservationEvent {
+            memory_id: ancient,
+            source: "replay".into(),
+            weight: 1.0,
+            ts: now - chrono::Duration::days(30),
+        });
+        assert_eq!(
+            b.candidates(),
+            vec![fresh, ancient],
+            "recency tier must be ordered by event time"
+        );
     }
 
     #[test]
@@ -514,6 +725,7 @@ mod tests {
             max_landmarks: 0,
             max_lookback: 0,
             max_beam: 5,
+            ..Default::default()
         });
         for _ in 0..50 {
             b.observe_now(Uuid::new_v4(), "test");

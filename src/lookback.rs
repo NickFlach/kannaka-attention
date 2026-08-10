@@ -68,12 +68,21 @@ pub(crate) fn sanitize_weight(weight: f32) -> f32 {
 #[derive(Debug, Clone)]
 struct Entry {
     id: Uuid,
+    /// Present only when the lookback is keying per-source. `None` means
+    /// all sources collapse onto the memory id, which is the default. (#3)
+    source: Option<String>,
     first_seen: DateTime<Utc>,
     last_seen: DateTime<Utc>,
     /// Accumulated observation strength. A deliberate observation at
     /// weight 10.0 pulls as hard as ten ambient ones — this is what makes
     /// `ObservationEvent.weight` mean something. (#13)
     weight: f32,
+}
+
+impl Entry {
+    fn matches(&self, id: Uuid, source: Option<&str>) -> bool {
+        self.id == id && self.source.as_deref() == source
+    }
 }
 
 /// Log-stride lookback. Owns a per-bucket cap and the bucket boundaries.
@@ -134,6 +143,19 @@ impl LogStrideLookback {
     /// observations accumulate, so a memory's standing in its bucket
     /// reflects both how often and how strongly it was attended. (#13)
     pub fn observe_weighted(&mut self, id: Uuid, now: DateTime<Utc>, weight: f32) {
+        self.record(id, None, now, weight);
+    }
+
+    /// Record an observation keyed on `(source, id)` rather than `id` alone.
+    ///
+    /// Used when the beam is configured `per_source`, so a left/right
+    /// mirror pair accumulate their own weight and bucket placement
+    /// independently instead of collapsing onto one entry. (#3)
+    pub fn observe_keyed(&mut self, id: Uuid, source: &str, now: DateTime<Utc>, weight: f32) {
+        self.record(id, Some(source), now, weight);
+    }
+
+    fn record(&mut self, id: Uuid, source: Option<&str>, now: DateTime<Utc>, weight: f32) {
         let weight = sanitize_weight(weight);
 
         // The reference clock only moves forward. An out-of-order or
@@ -144,12 +166,13 @@ impl LogStrideLookback {
             _ => now,
         });
 
-        if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.matches(id, source)) {
             entry.last_seen = entry.last_seen.max(now);
             entry.weight += weight;
         } else {
             self.entries.push(Entry {
                 id,
+                source: source.map(str::to_owned),
                 first_seen: now,
                 last_seen: now,
                 weight,
@@ -202,6 +225,7 @@ impl LogStrideLookback {
                     .total_cmp(&a.weight)
                     .then(b.last_seen.cmp(&a.last_seen))
                     .then(a.id.cmp(&b.id))
+                    .then_with(|| a.source.cmp(&b.source))
             });
             in_bucket.truncate(cap);
             kept.extend(in_bucket.into_iter().cloned());
@@ -242,6 +266,7 @@ impl LogStrideLookback {
                     .cmp(&a.last_seen)
                     .then(b.weight.total_cmp(&a.weight))
                     .then(a.id.cmp(&b.id))
+                    .then_with(|| a.source.cmp(&b.source))
             });
             out.extend(in_bucket.into_iter().map(|e| e.id));
         }
