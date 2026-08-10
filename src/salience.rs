@@ -41,6 +41,19 @@ pub struct GateContext<'a> {
 /// respect to the gate's own state — the beam may call `score` many times
 /// per snapshot and expects deterministic results within one snapshot
 /// cycle.
+///
+/// # Scope: the gate ranks landmarks, and only landmarks
+///
+/// A gate cannot reorder the recency or lookback tiers. Those are emitted
+/// first, in their own order, before any gate runs — and [`GateContext`]
+/// hands you `recency` and `lookback` as **inputs for scoring a landmark**
+/// ("is this exemplar warm right now?"), not as collections to be scored.
+///
+/// This is deliberate rather than an omission. Tier 1 exists to guarantee
+/// that a memory the sensor just reported is in the candidate set; letting
+/// a high-scoring landmark displace it is the exact failure the tier
+/// ordering prevents. If you need salience to govern the whole beam, that
+/// is a different composition and this trait is not the lever. (#9)
 pub trait SalienceGate: std::fmt::Debug + Send + Sync {
     /// Return the salience score for `landmark` given the current beam
     /// context. Higher = include first / weight more heavily.

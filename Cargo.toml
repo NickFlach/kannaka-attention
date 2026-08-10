@@ -1,6 +1,6 @@
 [package]
 name = "kannaka-attention"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Attention-as-gravity: a sparse-attention beam over kannaka-memory's holographic resonance medium. Recency ring + log-stride snapshots + landmark exemplars + optional salience gate, producing a K-sized candidate set for Medium::recall_against_ids. Pure Rust, no GPU/BLAS/vector-DB. Target: ARM/edge."
 license = "MIT"
