@@ -8,13 +8,31 @@
 //! without scanning every entry.
 //!
 //! The buckets do NOT store every memory at that age — they cap each bucket
-//! at a small N (default 8). When a bucket fills, the lowest-weight entry is
-//! evicted. Weight is currently observation count (how many times this memory
-//! showed up in the recency ring while it lived in this bucket), so the
-//! survivors are the ones that mattered.
+//! at a small N (default 8). When a bucket is over cap, the lowest-weight
+//! entries are dropped, so the survivors are the ones that mattered.
+//!
+//! # Aging is by `last_seen`, not `first_seen`
+//!
+//! A memory's bucket is decided by how long it has been since it was last
+//! *observed*, not since it was first created. Aging by `first_seen` (the
+//! previous behaviour) meant a memory observed a hundred times in the last
+//! minute still sat in the 30-day bucket because it happened to be old —
+//! which defeats the whole point of a reach structure that the beam reads
+//! newest-bucket-first. Re-observing a memory makes it fresh. (#23)
+//!
+//! # Placement is exact at every observation
+//!
+//! `observe` re-buckets the whole structure against the timestamp of the
+//! event being recorded. The structure is capped at
+//! `bucket_cap × (boundaries + 1)` entries — 64 by default — so a full
+//! re-bucket is a few dozen comparisons, cheap enough that there is no
+//! reason to defer it. The previous "rebalance every 32nd observation
+//! against `Utc::now()`" scheme was the direct cause of two defects: buckets
+//! were stale for up to 31 observations (#22), and aging was driven by wall
+//! clock rather than the event timeline, so replayed or backdated events
+//! bucketed wrongly and tests could not be deterministic (#25).
 
 use chrono::{DateTime, Duration, Utc};
-use std::collections::HashMap;
 use uuid::Uuid;
 
 /// The exponentially-spaced age boundaries used by [`LogStrideLookback`].
@@ -30,24 +48,46 @@ pub const DEFAULT_BOUNDARIES_SECONDS: &[i64] = &[
     30 * 24 * 3600, // < 30 d
 ];
 
+/// The documented clamp range for an observation's strength multiplier.
+/// Mirrors the contract on `ObservationEvent.weight`.
+pub const MIN_OBSERVATION_WEIGHT: f32 = 0.01;
+/// Upper end of the observation strength clamp.
+pub const MAX_OBSERVATION_WEIGHT: f32 = 10.0;
+
+/// Clamp an observation weight into the documented `[0.01, 10.0]` range,
+/// mapping non-finite input to the neutral 1.0. (#13)
+pub(crate) fn sanitize_weight(weight: f32) -> f32 {
+    if weight.is_finite() {
+        weight.clamp(MIN_OBSERVATION_WEIGHT, MAX_OBSERVATION_WEIGHT)
+    } else {
+        1.0
+    }
+}
+
 /// Per-memory state inside the lookback.
 #[derive(Debug, Clone)]
 struct Entry {
     id: Uuid,
     first_seen: DateTime<Utc>,
     last_seen: DateTime<Utc>,
-    observation_count: u32,
+    /// Accumulated observation strength. A deliberate observation at
+    /// weight 10.0 pulls as hard as ten ambient ones — this is what makes
+    /// `ObservationEvent.weight` mean something. (#13)
+    weight: f32,
 }
 
-/// Log-stride lookback. Owns a per-bucket cap and the bucket cursors.
+/// Log-stride lookback. Owns a per-bucket cap and the bucket boundaries.
 #[derive(Debug, Clone)]
 pub struct LogStrideLookback {
     boundaries: Vec<Duration>,
     bucket_cap: usize,
-    // bucket_index -> entries (newest-first within a bucket)
-    buckets: Vec<Vec<Entry>>,
-    // id -> (bucket_index, position) for fast updates. Rebuilt on rebalance.
-    locator: HashMap<Uuid, (usize, usize)>,
+    /// Flat entry list. Bucketing is derived from `last_seen` on demand
+    /// rather than stored, so there are no `(bucket, position)` indices to
+    /// go stale behind an eviction.
+    entries: Vec<Entry>,
+    /// The newest timestamp observed so far — the reference "now" used to
+    /// bucket entries in `snapshot`.
+    clock: Option<DateTime<Utc>>,
 }
 
 impl LogStrideLookback {
@@ -66,110 +106,107 @@ impl LogStrideLookback {
             .copied()
             .map(Duration::seconds)
             .collect();
-        let n_buckets = boundaries.len() + 1;
         Self {
             boundaries,
             bucket_cap: bucket_cap.max(1),
-            buckets: vec![Vec::new(); n_buckets],
-            locator: HashMap::new(),
+            entries: Vec::new(),
+            clock: None,
         }
     }
 
-    /// Record an observation. If the memory is already known, increment its
-    /// counter and refresh `last_seen`. Otherwise, place it into the
-    /// appropriate bucket based on `(now - first_seen)`.
+    /// Number of buckets, including the implicit overflow bucket.
+    fn n_buckets(&self) -> usize {
+        self.boundaries.len() + 1
+    }
+
+    /// Record an observation at unit weight.
     ///
     /// `now` is passed in (rather than read from the clock inside) so
-    /// callers can do exact-time test fixtures.
+    /// callers can do exact-time test fixtures, and so replayed events
+    /// bucket against the event timeline rather than wall clock. (#25)
     pub fn observe(&mut self, id: Uuid, now: DateTime<Utc>) {
-        if let Some(&(b, p)) = self.locator.get(&id) {
-            let entry = &mut self.buckets[b][p];
-            entry.last_seen = now;
-            entry.observation_count = entry.observation_count.saturating_add(1);
-            return;
-        }
-        // First observation. New entries start in bucket 0 (newest).
-        let entry = Entry {
-            id,
-            first_seen: now,
-            last_seen: now,
-            observation_count: 1,
-        };
-        let bucket = 0;
-        let buf = &mut self.buckets[bucket];
-        if buf.len() >= self.bucket_cap {
-            // Bucket is full. Find the lowest-weight resident; only displace
-            // it if the newcomer would outrank it. New entries arrive with
-            // count=1, so by default they lose to anyone with count>=2 —
-            // which is the right call: high-observation-count memories
-            // should stick.
-            let (min_pos, min_count) = buf
-                .iter()
-                .enumerate()
-                .map(|(p, e)| (p, e.observation_count))
-                .min_by_key(|&(_, c)| c)
-                .unwrap();
-            if entry.observation_count <= min_count {
-                // Newcomer is weaker (or equal); drop on the floor and don't
-                // register in the locator.
-                return;
-            }
-            // Displace the weakest.
-            let evicted = buf.remove(min_pos);
-            self.locator.remove(&evicted.id);
-            // Locator positions shift for this bucket — rebuild.
-            for (p, e) in self.buckets[bucket].iter().enumerate() {
-                self.locator.insert(e.id, (bucket, p));
-            }
-        }
-        let pos = self.buckets[bucket].len();
-        self.buckets[bucket].push(entry);
-        self.locator.insert(id, (bucket, pos));
+        self.observe_weighted(id, now, 1.0);
     }
 
-    /// Rebalance: move entries to the bucket their current age says they
-    /// belong in. Cheap (O(total entries)) and only needs to run periodically
-    /// — every few seconds is fine. Call before snapshotting if accuracy
-    /// matters; skip for hot-path observations.
-    pub fn rebalance(&mut self, now: DateTime<Utc>) {
-        let mut new_buckets: Vec<Vec<Entry>> = vec![Vec::new(); self.buckets.len()];
-        let mut new_locator: HashMap<Uuid, (usize, usize)> = HashMap::new();
-        let cap = self.bucket_cap;
-        let boundaries = self.boundaries.clone();
+    /// Record an observation carrying an explicit strength multiplier.
+    ///
+    /// `weight` is clamped to the documented `[0.01, 10.0]` range. Repeated
+    /// observations accumulate, so a memory's standing in its bucket
+    /// reflects both how often and how strongly it was attended. (#13)
+    pub fn observe_weighted(&mut self, id: Uuid, now: DateTime<Utc>, weight: f32) {
+        let weight = sanitize_weight(weight);
 
-        for bucket in self.buckets.drain(..) {
-            for entry in bucket {
-                let age = now - entry.first_seen;
-                let target = Self::bucket_for_age(&boundaries, age);
-                let buf = &mut new_buckets[target];
-                if buf.len() >= cap {
-                    // Lowest-weight eviction within the destination bucket.
-                    if let Some((min_pos, _)) = buf
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|(_, e)| e.observation_count)
-                    {
-                        if buf[min_pos].observation_count < entry.observation_count {
-                            buf.remove(min_pos);
-                        } else {
-                            continue; // newcomer is lower-weight, drop it
-                        }
-                    }
-                }
-                buf.push(entry);
-            }
+        // The reference clock only moves forward. An out-of-order or
+        // backdated event still updates its own entry, but must not drag
+        // the whole structure back in time and un-age everything else.
+        self.clock = Some(match self.clock {
+            Some(prev) if prev > now => prev,
+            _ => now,
+        });
+
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) {
+            entry.last_seen = entry.last_seen.max(now);
+            entry.weight += weight;
+        } else {
+            self.entries.push(Entry {
+                id,
+                first_seen: now,
+                last_seen: now,
+                weight,
+            });
         }
-        // Rebuild the locator in a single final pass AFTER all entries are
-        // placed. Doing it per-push above leaves stale (bucket, position)
-        // pairs whenever a later eviction (`buf.remove(min_pos)`) shifts the
-        // surviving entries down by one index. (#11)
-        for (b, bucket) in new_buckets.iter().enumerate() {
-            for (p, e) in bucket.iter().enumerate() {
-                new_locator.insert(e.id, (b, p));
-            }
+
+        self.enforce_caps();
+    }
+
+    /// Re-bucket every entry against `now` and re-apply the per-bucket caps.
+    ///
+    /// `observe` already does this on every call, so this is only needed
+    /// when time has passed without any new observation and the caller
+    /// wants aging reflected before reading [`snapshot`](Self::snapshot).
+    /// It is idempotent.
+    pub fn rebalance(&mut self, now: DateTime<Utc>) {
+        self.clock = Some(match self.clock {
+            Some(prev) if prev > now => prev,
+            _ => now,
+        });
+        self.enforce_caps();
+    }
+
+    /// Drop the weakest entries from any over-cap bucket.
+    ///
+    /// Ranking within a bucket is `(weight desc, last_seen desc, id asc)`.
+    /// The `last_seen` tiebreak is what unblocks a full bucket 0: a
+    /// newcomer arrives at weight 1.0 and used to *tie* every unit-weight
+    /// resident, and a tie was resolved in the resident's favour — so once
+    /// bucket 0 held `cap` entries, no new memory was ever admitted again
+    /// until something aged out. Freshest wins the tie now. (#14)
+    fn enforce_caps(&mut self) {
+        let now = match self.clock {
+            Some(c) => c,
+            None => return,
+        };
+        let cap = self.bucket_cap;
+        let boundaries = &self.boundaries;
+        let n_buckets = boundaries.len() + 1;
+
+        let mut kept: Vec<Entry> = Vec::with_capacity(self.entries.len().min(cap * n_buckets));
+        for bucket in 0..n_buckets {
+            let mut in_bucket: Vec<&Entry> = self
+                .entries
+                .iter()
+                .filter(|e| Self::bucket_for_age(boundaries, now - e.last_seen) == bucket)
+                .collect();
+            in_bucket.sort_by(|a, b| {
+                b.weight
+                    .total_cmp(&a.weight)
+                    .then(b.last_seen.cmp(&a.last_seen))
+                    .then(a.id.cmp(&b.id))
+            });
+            in_bucket.truncate(cap);
+            kept.extend(in_bucket.into_iter().cloned());
         }
-        self.buckets = new_buckets;
-        self.locator = new_locator;
+        self.entries = kept;
     }
 
     fn bucket_for_age(boundaries: &[Duration], age: Duration) -> usize {
@@ -181,25 +218,57 @@ impl LogStrideLookback {
         boundaries.len() // overflow bucket
     }
 
-    /// Snapshot the lookback as a flat vec of memory IDs, newest-bucket first.
+    /// Snapshot the lookback as a flat vec of memory IDs, newest-bucket
+    /// first and **newest-first within each bucket**.
+    ///
+    /// Within-bucket order used to be raw insertion order, i.e. oldest
+    /// first, which contradicted this type's own documentation and meant a
+    /// beam with a tight `max_lookback` spent its budget on the stalest
+    /// entries of the freshest bucket. (#15)
     pub fn snapshot(&self) -> Vec<Uuid> {
-        let mut out = Vec::new();
-        for bucket in &self.buckets {
-            for entry in bucket {
-                out.push(entry.id);
-            }
+        let now = match self.clock {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        let mut out = Vec::with_capacity(self.entries.len());
+        for bucket in 0..self.n_buckets() {
+            let mut in_bucket: Vec<&Entry> = self
+                .entries
+                .iter()
+                .filter(|e| Self::bucket_for_age(&self.boundaries, now - e.last_seen) == bucket)
+                .collect();
+            in_bucket.sort_by(|a, b| {
+                b.last_seen
+                    .cmp(&a.last_seen)
+                    .then(b.weight.total_cmp(&a.weight))
+                    .then(a.id.cmp(&b.id))
+            });
+            out.extend(in_bucket.into_iter().map(|e| e.id));
         }
         out
     }
 
     /// Total entries across all buckets.
     pub fn len(&self) -> usize {
-        self.locator.len()
+        self.entries.len()
     }
 
     /// True if empty.
     pub fn is_empty(&self) -> bool {
-        self.locator.is_empty()
+        self.entries.is_empty()
+    }
+
+    /// True if `id` is currently retained by the lookback.
+    pub fn contains(&self, id: &Uuid) -> bool {
+        self.entries.iter().any(|e| e.id == *id)
+    }
+
+    /// When `id` was first observed, if it is still retained.
+    pub fn first_seen(&self, id: &Uuid) -> Option<DateTime<Utc>> {
+        self.entries
+            .iter()
+            .find(|e| e.id == *id)
+            .map(|e| e.first_seen)
     }
 }
 
@@ -227,13 +296,8 @@ mod tests {
         let a = Uuid::new_v4();
         let t0 = Utc::now() - Duration::hours(2);
         l.observe(a, t0);
-        // Bucket 0 (< 1 min) at observation time, then rebalance at +2h.
         l.rebalance(t0 + Duration::hours(2));
-        // After 2h aging it should be in bucket 3 (< 3h).
         assert_eq!(l.snapshot(), vec![a]);
-        // We can't trivially observe bucket index externally without exposing
-        // internals, but the post-condition is that the entry survives and
-        // the locator points somewhere valid:
         assert_eq!(l.len(), 1);
     }
 
@@ -249,13 +313,164 @@ mod tests {
         l.observe(high, t);
         l.observe(mid, t);
         l.observe(mid, t);
-        // bucket 0 full at cap=2. Inserting `low` should evict the lowest:
-        // `low` itself is the lowest (count=1), so it's dropped on insert
-        // and `high`+`mid` survive.
         l.observe(low, t);
         let snap = l.snapshot();
         assert!(snap.contains(&high));
         assert!(snap.contains(&mid));
-        assert!(!snap.contains(&low));
+        assert!(!snap.contains(&low), "weakest entry is the one dropped");
+    }
+
+    #[test]
+    fn fresh_memories_still_admitted_after_bucket_zero_fills() {
+        // Regression for #14. Every newcomer arrives at weight 1.0 and used
+        // to tie the unit-weight residents; the tie went to the resident,
+        // so once bucket 0 held `cap` entries the lookback stopped
+        // admitting new memories entirely.
+        let mut l = LogStrideLookback::with_config(&[60], 4);
+        let t = Utc::now();
+        let filler: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
+        for (i, id) in filler.iter().enumerate() {
+            l.observe(*id, t + Duration::seconds(i as i64));
+        }
+        assert_eq!(l.len(), 4, "bucket 0 is full");
+
+        let newcomer = Uuid::new_v4();
+        l.observe(newcomer, t + Duration::seconds(10));
+        assert!(
+            l.snapshot().contains(&newcomer),
+            "a fresh memory must still get in once the bucket is full"
+        );
+        // The staleset unit-weight resident is the one that made way.
+        assert!(!l.snapshot().contains(&filler[0]));
+    }
+
+    #[test]
+    fn reobserving_refreshes_bucket_placement() {
+        // Regression for #23 — aging by first_seen pinned a heavily
+        // re-observed memory in the 30d bucket forever.
+        let mut l = LogStrideLookback::new();
+        let old = Uuid::new_v4();
+        let t0 = Utc::now() - Duration::days(20);
+        l.observe(old, t0);
+
+        let fresh = Uuid::new_v4();
+        let now = Utc::now();
+        l.observe(fresh, now);
+        // Re-observe the ancient memory right now.
+        l.observe(old, now);
+
+        let snap = l.snapshot();
+        assert_eq!(snap.len(), 2);
+        // Both are now in bucket 0; the re-observed one is not stranded at
+        // the far end of the snapshot behind six intervening buckets.
+        assert!(snap.contains(&old) && snap.contains(&fresh));
+        // first_seen is still preserved for callers that want provenance.
+        assert_eq!(l.first_seen(&old), Some(t0));
+    }
+
+    #[test]
+    fn snapshot_is_newest_first_within_a_bucket() {
+        // Regression for #15 — insertion order meant oldest-first inside a
+        // bucket, so a tight max_lookback spent its budget on the stalest
+        // entries of the freshest bucket.
+        let mut l = LogStrideLookback::new();
+        let t = Utc::now();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        l.observe(a, t);
+        l.observe(b, t + Duration::seconds(1));
+        l.observe(c, t + Duration::seconds(2));
+        assert_eq!(l.snapshot(), vec![c, b, a]);
+    }
+
+    #[test]
+    fn placement_is_exact_without_waiting_for_a_rebalance_tick() {
+        // Regression for #22 — buckets were only re-aged every 32nd
+        // observation, so a snapshot taken in between reported stale
+        // placement.
+        let mut l = LogStrideLookback::new();
+        let t0 = Utc::now();
+        let old = Uuid::new_v4();
+        l.observe(old, t0);
+
+        // One observation later, four hours on. `old` must already read as
+        // aged even though no rebalance tick has been reached.
+        let fresh = Uuid::new_v4();
+        l.observe(fresh, t0 + Duration::hours(4));
+
+        let snap = l.snapshot();
+        assert_eq!(
+            snap,
+            vec![fresh, old],
+            "the freshly observed id sorts into an earlier bucket immediately"
+        );
+    }
+
+    #[test]
+    fn weight_outranks_bare_repetition() {
+        // #13 — a single deliberate observation should outweigh a couple of
+        // ambient mentions.
+        let mut l = LogStrideLookback::with_config(&[60], 1);
+        let t = Utc::now();
+        let ambient = Uuid::new_v4();
+        let deliberate = Uuid::new_v4();
+        l.observe_weighted(ambient, t, 0.05);
+        l.observe_weighted(ambient, t, 0.05);
+        l.observe_weighted(deliberate, t, 10.0);
+        assert_eq!(l.snapshot(), vec![deliberate]);
+    }
+
+    #[test]
+    fn observation_weight_is_clamped_to_documented_range() {
+        assert_eq!(sanitize_weight(-5.0), MIN_OBSERVATION_WEIGHT);
+        assert_eq!(sanitize_weight(1e9), MAX_OBSERVATION_WEIGHT);
+        assert_eq!(sanitize_weight(f32::NAN), 1.0);
+        assert_eq!(sanitize_weight(f32::INFINITY), 1.0);
+        assert_eq!(sanitize_weight(2.5), 2.5);
+    }
+
+    #[test]
+    fn total_population_never_exceeds_cap_times_buckets() {
+        // Property: the structure's whole selling point is a hard memory
+        // ceiling. 8 buckets x cap 3 = 24, no matter how much we feed it.
+        let mut l = LogStrideLookback::with_config(DEFAULT_BOUNDARIES_SECONDS, 3);
+        let t = Utc::now();
+        for i in 0..500 {
+            l.observe(Uuid::new_v4(), t + Duration::seconds(i));
+        }
+        assert!(l.len() <= 3 * 8, "population {} exceeded the cap", l.len());
+    }
+
+    #[test]
+    fn backdated_event_does_not_unage_the_structure() {
+        // The reference clock only moves forward, so a late-arriving old
+        // event cannot drag everything else back into bucket 0.
+        let mut l = LogStrideLookback::new();
+        let t = Utc::now();
+        let recent = Uuid::new_v4();
+        l.observe(recent, t);
+
+        let backdated = Uuid::new_v4();
+        l.observe(backdated, t - Duration::days(10));
+
+        let snap = l.snapshot();
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap[0], recent, "the genuinely recent id still sorts first");
+    }
+
+    #[test]
+    fn rebalance_is_idempotent() {
+        let mut l = LogStrideLookback::new();
+        let t = Utc::now();
+        for i in 0..20 {
+            l.observe(Uuid::new_v4(), t + Duration::seconds(i));
+        }
+        let once = {
+            l.rebalance(t + Duration::hours(1));
+            l.snapshot()
+        };
+        l.rebalance(t + Duration::hours(1));
+        assert_eq!(once, l.snapshot());
     }
 }

@@ -34,8 +34,8 @@ The beam is **what the agent is paying attention to right now**. Composed from f
 | component | window | purpose |
 |---|---|---|
 | **Recency** | last K observations | sharp short-term focus |
-| **Lookback** | log-stride snapshots (1m, 5m, 30m, 4h...) | catch the medium-term recurring stuff |
-| **Landmarks** | exemplar wavefronts | always-considered anchors (chosen by gate) |
+| **Lookback** | log-stride buckets (1m, 5m, 30m, 3h, 1d, 7d, 30d) | catch the medium-term recurring stuff |
+| **Landmarks** | exemplar wavefronts | always-considered anchors (ranked by gate) |
 | **Salience gate** | optional `SalienceGate` impl | reshape weights with external signal |
 
 ---
@@ -48,11 +48,12 @@ The beam is **what the agent is paying attention to right now**. Composed from f
 ├──────────────────┬────────────────┬──────────────────┤
 │  Recency         │  Lookback      │  Landmarks       │
 │  · ring buffer   │  · log-stride  │  · exemplar set  │
-│  · O(1) push     │  · age buckets │  · gated by Φ    │
+│  · O(1) push     │  · aged by     │  · gated by      │
+│                  │    last_seen   │    SalienceGate  │
 ├──────────────────┼────────────────┼──────────────────┤
 │  Beam composer                                       │
 │  · merge with dedupe                                 │
-│  · cap at top_k                                      │
+│  · cap at max_beam                                   │
 │  · optional Salience reweighting                     │
 ├──────────────────────────────────────────────────────┤
 │  SalienceGate trait                                  │
@@ -73,7 +74,37 @@ Pure std-only Rust. No GPU. No BLAS. No vector DB. Target: ARM / edge devices wh
 kannaka-attention = { git = "https://github.com/NickFlach/kannaka-attention" }
 ```
 
-Wired into `kannaka attention serve` — consumes `KANNAKA.attention.eye` events from the bus and exports the current beam to `/tmp/kannaka-attention-beam.json` so any consumer (TUI, observatory, recall path) can read which IDs are "in focus" right now.
+This crate is a **library only** — no binary, no NATS client, no file export. It
+does no I/O at all. The host owns the bus subscription and decides what to do
+with the beam:
+
+```rust
+use kannaka_attention::{AttentionBeam, BeamConfig, ObservationEvent};
+
+let mut beam = AttentionBeam::with_config(BeamConfig {
+    max_beam: 128,
+    ..Default::default()
+});
+
+// Feed it whatever your sensors report. `weight` grades the observation:
+// 1.0 is a normal mention, higher is a deliberate reference.
+beam.observe(&ObservationEvent {
+    memory_id,
+    source: "eye:left".into(),
+    weight: 1.0,
+    ts: chrono::Utc::now(),
+});
+
+// Read the current focus and score only these against the medium.
+let ids = beam.candidates();
+```
+
+`BeamConfig` round-trips through serde and fills omitted fields from
+`Default`, so a host can load a partial config (`{"max_beam": 128}`) from its
+own config file.
+
+Wiring the beam to `KANNAKA.attention.eye` and publishing the result is the
+host's job — see `kannaka-eye` for the producer side.
 
 ---
 

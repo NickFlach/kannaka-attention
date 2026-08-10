@@ -6,7 +6,6 @@
 //! and their cluster pulls the beam. The beam emits a deduped, ranked set
 //! of memory IDs that should be scored on the next recall.
 
-use chrono::Utc;
 use std::collections::HashSet;
 use uuid::Uuid;
 
@@ -18,7 +17,13 @@ use crate::ObservationEvent;
 
 /// Configuration knobs for the beam. Defaults are tuned for an ARM A1 / Pi 5
 /// class box with a medium of 10k–1M memories.
-#[derive(Debug, Clone)]
+///
+/// `#[serde(default)]` is what makes a partial config usable: a payload that
+/// sets only `max_beam` fills the rest from [`BeamConfig::default`] instead
+/// of failing on the first absent field. Without it, every consumer wanting
+/// to override one knob had to restate all four out of band. (#16)
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct BeamConfig {
     /// Recency ring capacity. 128 is enough to span a small conversation;
     /// raise to 512 for long-running narrative work.
@@ -96,19 +101,23 @@ impl AttentionBeam {
         self.gate.as_ref().map(|g| g.name()).unwrap_or("none")
     }
 
-    /// Observe a memory. Pushes into recency + lookback. The `weight` field
-    /// of the event reserves room for a future salience gate but is not yet
-    /// used in v1 (every observation lands with the same weight).
+    /// Observe a memory. Pushes into recency + lookback.
+    ///
+    /// `ev.weight` is honored: it is clamped to the documented
+    /// `[0.01, 10.0]` range and accumulated as the memory's standing in the
+    /// lookback, so a deliberate reference outranks an ambient mention
+    /// rather than counting the same. It used to be dropped on the floor,
+    /// which made the documented clamp contract false and flattened
+    /// graded attention to binary observed/not-observed. (#13)
+    ///
+    /// Bucket placement uses `ev.ts`, the event's own timestamp, not wall
+    /// clock — so replayed and backdated events land where they belong and
+    /// callers can write exact-time fixtures. (#25)
     pub fn observe(&mut self, ev: &ObservationEvent) {
         self.recency.push(ev.memory_id);
-        self.lookback.observe(ev.memory_id, ev.ts);
+        self.lookback
+            .observe_weighted(ev.memory_id, ev.ts, ev.weight);
         self.obs_count = self.obs_count.wrapping_add(1);
-        // Every 32 observations, rebalance the lookback so age buckets
-        // stay accurate. Cheap (O(total entries)) and bounded since the
-        // lookback caps total entries at ~64.
-        if self.obs_count.is_multiple_of(32) {
-            self.lookback.rebalance(Utc::now());
-        }
     }
 
     /// Convenience: observe by id with `Utc::now()` and source label.
@@ -141,28 +150,37 @@ impl AttentionBeam {
         let mut out = Vec::with_capacity(self.config.max_beam);
         let mut seen = HashSet::with_capacity(self.config.max_beam);
 
+        // Check the ceiling BEFORE pushing, not after. The post-push check
+        // let `max_beam = 0` still emit one id — a hard budget that can be
+        // overrun by one is not a budget, and downstream scheduling and
+        // backpressure assume it holds exactly. (#1)
+        if self.config.max_beam == 0 {
+            return out;
+        }
+
         let recency_snap = self.recency.snapshot();
         let lookback_snap = self.lookback.snapshot();
 
         for id in &recency_snap {
+            if out.len() >= self.config.max_beam {
+                return out;
+            }
             if seen.insert(*id) {
                 out.push(*id);
-                if out.len() >= self.config.max_beam {
-                    return out;
-                }
             }
         }
-        let mut taken = 0usize;
-        for id in &lookback_snap {
-            if taken >= self.config.max_lookback {
-                break;
+        // `take` bounds the lookback POSITIONS INSPECTED, not the unique
+        // ids admitted. The old loop only counted successful inserts, so an
+        // entry that overlapped recency cost nothing and the walk continued
+        // deeper into history until it had admitted `max_lookback` *new*
+        // ids — turning a locality knob into "reach as far back as
+        // needed". (#21)
+        for id in lookback_snap.iter().take(self.config.max_lookback) {
+            if out.len() >= self.config.max_beam {
+                return out;
             }
             if seen.insert(*id) {
                 out.push(*id);
-                taken += 1;
-                if out.len() >= self.config.max_beam {
-                    return out;
-                }
             }
         }
         // Landmark ordering goes through the gate when one is installed.
@@ -177,17 +195,16 @@ impl AttentionBeam {
         } else {
             self.landmarks.snapshot()
         };
-        let mut taken = 0usize;
-        for id in landmark_order {
-            if taken >= self.config.max_landmarks {
-                break;
+        // Same positions-inspected accounting as the lookback tier (#21):
+        // a landmark that already arrived via recency still spends its
+        // slot, so `max_landmarks` bounds how far down the ranked landmark
+        // list the beam reaches.
+        for id in landmark_order.into_iter().take(self.config.max_landmarks) {
+            if out.len() >= self.config.max_beam {
+                return out;
             }
             if seen.insert(id) {
                 out.push(id);
-                taken += 1;
-                if out.len() >= self.config.max_beam {
-                    return out;
-                }
             }
         }
         out
@@ -307,6 +324,187 @@ mod tests {
         // produces a deduped beam.
         assert!(cands.contains(&warm));
         assert!(cands.contains(&cold));
+    }
+
+    #[test]
+    fn max_beam_zero_emits_nothing() {
+        // Regression for #1 — the cap was checked after pushing, so a
+        // budget of 0 still produced one candidate.
+        let mut b = AttentionBeam::with_config(BeamConfig {
+            recency_capacity: 8,
+            max_landmarks: 8,
+            max_lookback: 8,
+            max_beam: 0,
+        });
+        let id = Uuid::new_v4();
+        b.observe_now(id, "test");
+        b.upsert_landmark(Landmark {
+            id: Uuid::new_v4(),
+            cluster_label: "c".into(),
+            weight: 5.0,
+        });
+        assert!(b.candidates().is_empty());
+    }
+
+    #[test]
+    fn beam_never_exceeds_max_beam_for_any_config() {
+        // Property: whatever the tier caps say, the total budget holds.
+        for max_beam in 0..12usize {
+            let mut b = AttentionBeam::with_config(BeamConfig {
+                recency_capacity: 32,
+                max_landmarks: 32,
+                max_lookback: 32,
+                max_beam,
+            });
+            for i in 0..20 {
+                b.observe_now(Uuid::new_v4(), "test");
+                b.upsert_landmark(Landmark {
+                    id: Uuid::new_v4(),
+                    cluster_label: format!("cluster-{i}"),
+                    weight: i as f32,
+                });
+            }
+            let c = b.candidates();
+            assert!(
+                c.len() <= max_beam,
+                "max_beam={max_beam} produced {} candidates",
+                c.len()
+            );
+        }
+    }
+
+    #[test]
+    fn max_lookback_bounds_reach_even_when_recency_overlaps() {
+        // Regression for #21 — `taken` only counted successful inserts, so
+        // lookback entries already covered by recency were free and the
+        // loop reached deeper into history than the budget allowed.
+        let mut b = AttentionBeam::with_config(BeamConfig {
+            recency_capacity: 2,
+            max_landmarks: 0,
+            max_lookback: 1,
+            max_beam: 16,
+        });
+        let a = Uuid::new_v4();
+        let mid = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        b.observe_now(a, "test");
+        b.observe_now(mid, "test");
+        b.observe_now(c, "test");
+
+        let cands = b.candidates();
+        // recency holds [c, mid]; the single lookback slot inspected is
+        // already covered by recency, so `a` must NOT be resurrected.
+        assert!(
+            !cands.contains(&a),
+            "max_lookback=1 must not reach past the first lookback slot: {cands:?}"
+        );
+    }
+
+    #[test]
+    fn candidate_order_is_deterministic_across_runs() {
+        // Regression for #7 — equal-weight landmarks kept HashMap
+        // iteration order, which Rust randomises per process.
+        let build = || {
+            let mut b = AttentionBeam::with_config(BeamConfig {
+                recency_capacity: 0,
+                max_landmarks: 8,
+                max_lookback: 0,
+                max_beam: 16,
+            });
+            // Same weight for all — nothing but the tiebreak to separate them.
+            for (n, label) in ["delta", "alpha", "charlie", "bravo"].iter().enumerate() {
+                b.upsert_landmark(Landmark {
+                    id: Uuid::from_u128(n as u128 + 1),
+                    cluster_label: (*label).into(),
+                    weight: 1.0,
+                });
+            }
+            b.candidates()
+        };
+        let first = build();
+        assert_eq!(first.len(), 4);
+        for _ in 0..16 {
+            assert_eq!(first, build(), "equal-weight ordering must be stable");
+        }
+    }
+
+    #[test]
+    fn observation_weight_reaches_the_lookback() {
+        // #13 — a deliberate observation should outrank ambient noise.
+        // recency is disabled so the ordering under test is the lookback's.
+        let mut b = AttentionBeam::with_config(BeamConfig {
+            recency_capacity: 0,
+            max_landmarks: 0,
+            max_lookback: 8,
+            max_beam: 16,
+        });
+        let ambient = Uuid::new_v4();
+        let deliberate = Uuid::new_v4();
+        let t = chrono::Utc::now();
+        b.observe(&ObservationEvent {
+            memory_id: ambient,
+            source: "ambient".into(),
+            weight: 0.05,
+            ts: t,
+        });
+        b.observe(&ObservationEvent {
+            memory_id: deliberate,
+            source: "user".into(),
+            weight: 10.0,
+            ts: t,
+        });
+        let cands = b.candidates();
+        assert_eq!(cands.len(), 2);
+        // Same bucket, same last_seen — weight is the only separator.
+        assert_eq!(
+            cands[0], deliberate,
+            "the deliberate reference should lead: {cands:?}"
+        );
+    }
+
+    #[test]
+    fn observe_uses_event_timestamp_not_wall_clock() {
+        // #25 — bucketing off Utc::now() made replayed/backdated events
+        // land in the wrong bucket and made tests unwriteable.
+        let mut b = AttentionBeam::with_config(BeamConfig {
+            recency_capacity: 0,
+            max_landmarks: 0,
+            max_lookback: 8,
+            max_beam: 16,
+        });
+        let now = chrono::Utc::now();
+        let ancient = Uuid::new_v4();
+        let fresh = Uuid::new_v4();
+        b.observe(&ObservationEvent {
+            memory_id: ancient,
+            source: "replay".into(),
+            weight: 1.0,
+            ts: now - chrono::Duration::days(20),
+        });
+        b.observe(&ObservationEvent {
+            memory_id: fresh,
+            source: "live".into(),
+            weight: 1.0,
+            ts: now,
+        });
+        // The 20-day-old event must sort into a far older bucket, so the
+        // fresh id leads even though it was observed second.
+        assert_eq!(b.candidates(), vec![fresh, ancient]);
+    }
+
+    #[test]
+    fn beam_config_deserializes_partially() {
+        // Regression for #16 — a partial config had to restate every field.
+        let cfg: BeamConfig = serde_json::from_str(r#"{"max_beam": 8}"#).expect("partial config");
+        assert_eq!(cfg.max_beam, 8);
+        let d = BeamConfig::default();
+        assert_eq!(cfg.recency_capacity, d.recency_capacity);
+        assert_eq!(cfg.max_landmarks, d.max_landmarks);
+        assert_eq!(cfg.max_lookback, d.max_lookback);
+
+        // And an empty payload is the full default.
+        let empty: BeamConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty.max_beam, d.max_beam);
     }
 
     #[test]

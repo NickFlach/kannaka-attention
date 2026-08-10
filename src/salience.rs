@@ -117,13 +117,14 @@ pub fn rank_landmarks(
     gate: &dyn SalienceGate,
     ctx: &GateContext<'_>,
 ) -> Vec<(Uuid, f32)> {
-    let mut scored: Vec<(Uuid, f32)> = set
+    let mut scored: Vec<(Uuid, f32, &str)> = set
         .iter()
-        .map(|(id, l)| (*id, gate.score(l, ctx)))
+        .map(|(id, l)| (*id, gate.score(l, ctx), l.cluster_label.as_str()))
         .collect();
-    // total_cmp: NaN-safe total order over f32 scores. (#12)
-    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-    scored
+    // total_cmp: NaN-safe total order over f32 scores, cluster_label
+    // tiebreak for reproducibility. (#12, #7)
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.2.cmp(b.2)));
+    scored.into_iter().map(|(id, s, _)| (id, s)).collect()
 }
 
 /// Snapshot helper that wraps a `LandmarkSet`-like map + an optional
@@ -148,7 +149,13 @@ pub(crate) fn snapshot_with_gate(
         })
         .collect();
     // total_cmp: NaN-safe total order over f32 scores. (#12)
-    entries.sort_by(|a, b| b.1.total_cmp(&a.1));
+    // cluster_label tiebreak: without it, equal-scoring landmarks kept
+    // HashMap iteration order, which Rust randomises per process — so the
+    // same beam state could emit different candidate sets run to run. (#7)
+    entries.sort_by(|a, b| {
+        b.1.total_cmp(&a.1)
+            .then_with(|| a.2.cluster_label.cmp(&b.2.cluster_label))
+    });
     entries.into_iter().map(|(id, _, _)| id).collect()
 }
 
