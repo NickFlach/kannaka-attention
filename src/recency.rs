@@ -23,9 +23,13 @@ impl RecencyRing {
     /// Create a ring with the given capacity. A reasonable default is 128 —
     /// large enough to span a small conversation, small enough to be cheap
     /// even on a Pi Zero.
+    ///
+    /// A capacity of `0` disables the recency tier entirely. It used to be
+    /// silently promoted to 1, so a config that asked for no recency still
+    /// got one id in every beam. (#17)
     pub fn new(capacity: usize) -> Self {
         Self {
-            capacity: capacity.max(1),
+            capacity,
             buf: VecDeque::with_capacity(capacity),
         }
     }
@@ -33,13 +37,18 @@ impl RecencyRing {
     /// Push an observation. If `id` is already in the ring it's moved to the
     /// front (most-recent), not duplicated — observing the same memory twice
     /// in quick succession should keep the ring tight, not flush it.
+    ///
+    /// A no-op at capacity 0.
     pub fn push(&mut self, id: Uuid) {
+        if self.capacity == 0 {
+            return;
+        }
         // Cheap-but-correct dedup: scan + remove. For capacity 128 this is
         // never the bottleneck.
         if let Some(pos) = self.buf.iter().position(|x| *x == id) {
             self.buf.remove(pos);
         }
-        if self.buf.len() == self.capacity {
+        while self.buf.len() >= self.capacity {
             self.buf.pop_back();
         }
         self.buf.push_front(id);
@@ -92,6 +101,18 @@ mod tests {
         r.push(a);
         assert_eq!(r.len(), 2);
         assert_eq!(r.snapshot(), vec![a, b]);
+    }
+
+    #[test]
+    fn zero_capacity_disables_the_tier() {
+        // Regression for #17 — capacity 0 was promoted to 1, so a config
+        // asking for no recency tier still emitted one id per beam.
+        let mut r = RecencyRing::new(0);
+        r.push(Uuid::new_v4());
+        r.push(Uuid::new_v4());
+        assert_eq!(r.len(), 0);
+        assert!(r.snapshot().is_empty());
+        assert_eq!(r.capacity(), 0);
     }
 
     #[test]
